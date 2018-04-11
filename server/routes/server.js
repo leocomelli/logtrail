@@ -60,7 +60,7 @@ function convertToClientFormat(selected_config, esResponse) {
       for (var k = 0, len = fields.length; k < len; k++) {
         if (typeof source[fields[k]] === 'object') {
           var match = message_format_regex.exec(msgFmt)
-          if (match !== null) {
+          if (match !== null && typeof source[fields[k]] !== 'undefined') {
             var fieldKeys = Object.keys(source[fields[k]])
             msgFmt += ' '
             for (var j = 0, lg = fieldKeys.length; j < lg; j++) {
