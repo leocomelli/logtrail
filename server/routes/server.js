@@ -1,10 +1,11 @@
 import { initServerContext, updateKeywordInfo } from './init_server_context.js';
 
-function getMessageTemplate(handlebar, selectedConfig) {
-  var messageFormat = selectedConfig.fields.message_format;
-  //Append <a> tags for click to message format except for message field
-  var messageFormatRegex = /({{{[\[]?(\S+?)[\]]?}}})/g; // e.g. {{{[pid]}}} {{{program-name}}} : {{syslog_message}}
-  var ngClickTemplate = handlebar.compile('<a class="ng-binding" ng-click="onClick(\'{{name_no_braces}}\',\'{{name}}\')">{{name}}</a>',
+var message_format_regex = /({{{(\S+)}}})/g;
+var message_format_object_field_regex = /{{{(\S+)\.}}}/g;
+
+function getMessageTemplate(handlebar, msg_format, message_mapping) {
+  //Append <a> tags for click to message format except for message field  
+  var ng_click_template = handlebar.compile("<a class=\"ng-binding\" title=\"{{title}}\" ng-click=\"onClick('{{name_no_braces}}','{{name}}')\">{{name}}</a>",
     {
       knownHelpers: {
         log: false,
@@ -12,20 +13,24 @@ function getMessageTemplate(handlebar, selectedConfig) {
       },
       knownHelpersOnly: true
     });
-  var messageField = '{{{' + selectedConfig.fields.mapping.message + '}}}';
-  var messageTemplate = messageFormat;
+  var messageField = "{{{" + message_mapping + "}}}";
+  var messageTemplate = msg_format;
 
-  var match = messageFormatRegex.exec(messageFormat);
+  var match = message_format_regex.exec(msg_format);
   while (match !== null) {
     if (match[0] !== messageField) {
+      if (match[2].lastIndexOf('.') > -1) {
+        var title = match[2].split(".").pop();
+      }
       var context = {
-        name : match[0],
-        name_no_braces : match[2]
+        name: match[0],
+        name_no_braces: match[2],
+        title: title
       };
-      var messageWithClickAttr = ngClickTemplate(context);
-      messageTemplate = messageTemplate.replace(match[0], messageWithClickAttr);
+      var with_click = ng_click_template(context);
+      messageTemplate = messageTemplate.replace(match[0], with_click);
     }
-    match = messageFormatRegex.exec(messageFormat);
+    match = message_format_regex.exec(msg_format);
   }
   return messageTemplate; //<a class="ng-binding" ng-click="onClick('pid','{{pid}}')">{{pid}}</a> : {{syslog_message}}
 }
@@ -33,22 +38,49 @@ function getMessageTemplate(handlebar, selectedConfig) {
 function convertToClientFormat(selectedConfig, esResponse) {
   var clientResponse = [];
   var hits = esResponse.hits.hits;
+
   var template = null;
+  var handlebar = require('handlebars');
   var messageFormat = selectedConfig.fields.message_format;
-  if (messageFormat) {
-    var handlebar = require('handlebars');
-    var messageTemplate = getMessageTemplate(handlebar, selectedConfig);
-    template = handlebar.compile(messageTemplate, {
-      knownHelpers: {
-        log: false,
-        lookup: false
-      },
-      knownHelpersOnly: true
-    });
-  }
+
   for (let i = 0; i < hits.length; i++) {
     var event = {};
-    var source =  hits[i]._source;
+    var source = hits[i]._source;
+
+    if (messageFormat) {
+      var msgFmt = messageFormat
+      var fields = []
+      var m;
+
+      while (m = message_format_object_field_regex.exec(msgFmt)) {
+        msgFmt = msgFmt.replace('{{{' + m[1] + '.}}}', '')
+        fields.push(m[1])
+      }
+
+      for (var k = 0, len = fields.length; k < len; k++) {
+        if (typeof source[fields[k]] === 'object') {
+          var match = message_format_regex.exec(msgFmt)
+          if (match !== null && typeof source[fields[k]] !== 'undefined') {
+            var fieldKeys = Object.keys(source[fields[k]])
+            msgFmt += ' '
+            for (var j = 0, lg = fieldKeys.length; j < lg; j++) {
+              msgFmt += '{{{' + fields[k] + '.' + fieldKeys[j] + '}}} '
+            }
+            msgFmt += ' '
+          }
+        }
+      }
+
+      var messageTemplate = getMessageTemplate(handlebar, msgFmt, selectedConfig.fields.mapping.message);
+      var template = handlebar.compile(messageTemplate, {
+        knownHelpers: {
+          log: false,
+          lookup: false
+        },
+        knownHelpersOnly: true
+      });
+    }
+
     event.id = hits[i]._id;
     let get = require('lodash.get');
     event.timestamp = get(source, selectedConfig.fields.mapping.timestamp);
@@ -60,14 +92,14 @@ function convertToClientFormat(selectedConfig, esResponse) {
       var colorField = get(source, selectedConfig.color_mapping.field);
       var color = selectedConfig.color_mapping.mapping[colorField];
       if (color) {
-        event.color =  color;
+        event.color = color;
       }
     }
 
     //Change the source['message'] to highlighter text if available
     if (hits[i].highlight) {
       var set = require('lodash.set');
-      var withHighlights = get(hits[i].highlight, [selectedConfig.fields.mapping.message,0]);
+      var withHighlights = get(hits[i].highlight, [selectedConfig.fields.mapping.message, 0]);
       set(source, selectedConfig.fields.mapping.message, withHighlights);
       source[selectedConfig.fields.mapping.message] = hits[i].highlight[selectedConfig.fields.mapping.message][0];
     }
@@ -77,8 +109,8 @@ function convertToClientFormat(selectedConfig, esResponse) {
     message = escape(message);
     //if highlight is present then replace pre and post tag with html
     if (hits[i].highlight) {
-      message = message.replace(/logtrail.highlight.pre_tag/g,'<span class="highlight">');
-      message = message.replace(/logtrail.highlight.post_tag/g,'</span>');
+      message = message.replace(/logtrail.highlight.pre_tag/g, '<span class="highlight">');
+      message = message.replace(/logtrail.highlight.post_tag/g, '</span>');
     }
     source[selectedConfig.fields.mapping.message] = message;
 
@@ -97,7 +129,7 @@ function convertToClientFormat(selectedConfig, esResponse) {
 module.exports = function (server) {
 
   var context = {};
-  initServerContext(server,context);
+  initServerContext(server, context);
 
   //Search
   server.route({
@@ -128,30 +160,30 @@ module.exports = function (server) {
       var searchRequest = {
         index: selectedConfig.es.default_index,
         size: selectedConfig.max_buckets,
-        body : {
-          sort : [{}],
-          query : {
-            bool : {
-              must :{
-                query_string : {
+        body: {
+          sort: [{}],
+          query: {
+            bool: {
+              must: {
+                query_string: {
                   analyze_wildcard: true,
-                  default_field : selectedConfig.fields.mapping.message,
-                  query : searchText
+                  default_field: selectedConfig.fields.mapping.message,
+                  query: searchText
                 }
               },
               filter: {
-                bool : {
-                  must : [
+                bool: {
+                  must: [
                   ],
-	                  must_not:[],
+                  must_not: [],
                 }
               }
             }
           },
-          highlight : {
-            pre_tags : ['logtrail.highlight.pre_tag'],
-            post_tags : ['logtrail.highlight.post_tag'],
-            fields : {
+          highlight: {
+            pre_tags: ['logtrail.highlight.pre_tag'],
+            post_tags: ['logtrail.highlight.post_tag'],
+            fields: {
             }
           }
         }
@@ -162,12 +194,12 @@ module.exports = function (server) {
       };
 
       //By default Set sorting column to timestamp
-      searchRequest.body.sort[0][selectedConfig.fields.mapping.timestamp] = {'order':request.payload.order ,'unmapped_type': 'boolean'};
+      searchRequest.body.sort[0][selectedConfig.fields.mapping.timestamp] = { 'order': request.payload.order, 'unmapped_type': 'boolean' };
 
       //If hostname is present then term query.
       if (request.payload.hostname != null) {
         var termQuery = {
-          term : {
+          term: {
           }
         };
         var hostnameField = selectedConfig.fields.mapping.hostname;
@@ -185,7 +217,7 @@ module.exports = function (server) {
         if (selectedConfig.default_time_range_in_days !== 0) {
           var moment = require('moment');
           timestamp = moment().subtract(
-            selectedConfig.default_time_range_in_days,'days').startOf('day').valueOf();
+            selectedConfig.default_time_range_in_days, 'days').startOf('day').valueOf();
           rangeType = 'gte';
         }
       }
@@ -193,7 +225,7 @@ module.exports = function (server) {
       //If timestamps are present set ranges
       if (timestamp != null) {
         var rangeQuery = {
-          range : {
+          range: {
 
           }
         };
@@ -205,7 +237,7 @@ module.exports = function (server) {
       }
       //console.log(JSON.stringify(searchRequest));
 
-      callWithRequest(request,'search',searchRequest).then(function (resp) {
+      callWithRequest(request, 'search', searchRequest).then(function (resp) {
         reply({
           ok: true,
           resp: convertToClientFormat(selectedConfig, resp)
@@ -214,7 +246,7 @@ module.exports = function (server) {
         if (resp.isBoom) {
           reply(resp);
         } else {
-          console.error('Error while executing search',resp);
+          console.error('Error while executing search', resp);
           reply({
             ok: false,
             resp: resp
@@ -228,7 +260,7 @@ module.exports = function (server) {
   server.route({
     method: ['POST'],
     path: '/logtrail/hosts',
-    handler: function (request,reply) {
+    handler: function (request, reply) {
       var config = context.config;
       const { callWithRequest } = server.plugins.elasticsearch.getCluster('data');
       var index = request.payload.index;
@@ -247,7 +279,7 @@ module.exports = function (server) {
       //field mapped to hostname key is not of type keyword.
       if (hostnameField == null) {
         var errorMessage = selectedConfig.fields.mapping.hostname +
-        ' field not of type keyword or keyword mapping does not exist.';
+          ' field not of type keyword or keyword mapping does not exist.';
         reply({
           ok: false,
           resp: errorMessage
@@ -256,7 +288,7 @@ module.exports = function (server) {
       }
       var hostAggRequest = {
         index: selectedConfig.es.default_index,
-        body : {
+        body: {
           size: 0,
           aggs: {
             hosts: {
@@ -269,7 +301,7 @@ module.exports = function (server) {
         }
       };
 
-      callWithRequest(request,'search',hostAggRequest).then(function (resp) {
+      callWithRequest(request, 'search', hostAggRequest).then(function (resp) {
         //console.log(JSON.stringify(resp));//.aggregations.hosts.buckets);
         reply({
           ok: true,
@@ -277,10 +309,10 @@ module.exports = function (server) {
         });
       }).catch(function (resp) {
 
-        if(resp.isBoom) {
+        if (resp.isBoom) {
           reply(resp);
         } else {
-          console.error('Error while fetching hosts',resp);
+          console.error('Error while fetching hosts', resp);
           reply({
             ok: false,
             resp: resp
